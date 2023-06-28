@@ -1,0 +1,113 @@
+name: Validate ingress
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Setup OPA executable
+        uses: open-policy-agent/setup-opa@v2
+        with:
+          version: latest
+
+      - name: Build and serve OPA policies
+        working-directory: policies
+        run: |
+          opa build -b .
+          docker run --rm --name bundle-server -d -p 8888:80 -v ${PWD}:/usr/share/nginx/html:ro nginx:latest
+
+      - name: Setup minikube
+        id: minikube
+        uses: medyagh/setup-minikube@latest
+        with:
+          addons: ingress
+
+      - name: Configure kubectl
+        run: |
+          kubectl create namespace opa
+          kubectl config set-context default --user minikube --cluster minikube --namespace opa
+          kubectl config use-context default
+
+      - name: Configure OPA certs and secret
+        working-directory: setup
+        run: |
+          openssl genrsa -out ca.key 2048
+          openssl req -x509 -new -nodes -sha256 -key ca.key -days 100000 -out ca.crt -subj "/CN=admission_ca"
+
+          openssl genrsa -out server.key 2048
+          openssl req -new -key server.key -sha256 -out server.csr -extensions v3_ext -config server.conf
+          openssl x509 -req -in server.csr -sha256 -CA ca.crt -CAkey ca.key -CAcreateserial -out server.crt -days 100000 -extensions v3_ext -extfile server.conf
+
+          echo "Creating opa-server secret..."
+          kubectl create secret tls opa-server --cert=server.crt --key=server.key --namespace opa
+
+      - name: Delete default nginx ingress validation
+        run: kubectl delete -A ValidatingWebhookConfiguration ingress-nginx-admission
+
+      - name: Create OPA admission controller and webhook
+        working-directory: setup
+        run: |
+          kubectl apply -f admission-controller.yaml
+
+          cat <<EOF | kubectl apply -f -
+          kind: ValidatingWebhookConfiguration
+          apiVersion: admissionregistration.k8s.io/v1
+          metadata:
+            name: opa-validating-webhook
+          webhooks:
+            - name: validating-webhook.openpolicyagent.org
+              namespaceSelector:
+                matchExpressions:
+                - key: openpolicyagent.org/webhook
+                  operator: NotIn
+                  values:
+                  - ignore
+              rules:
+                - operations: ["CREATE", "UPDATE"]
+                  apiGroups: ["*"]
+                  apiVersions: ["*"]
+                  resources: ["*"]
+              clientConfig:
+                caBundle: $(cat ca.crt | base64 | tr -d '\n')
+                service:
+                  namespace: opa
+                  name: opa
+              admissionReviewVersions: ["v1"]
+              sideEffects: None
+          EOF
+
+      - name: Ignore OPA webhook for admin namespaces
+        run: |
+          kubectl label ns kube-system openpolicyagent.org/webhook=ignore
+          kubectl label ns opa openpolicyagent.org/webhook=ignore
+
+      - name: Wait for OPA to become ready...
+        run: |
+          kubectl wait --for=condition=ready pod -l app=opa
+          kubectl port-forward svc/opa 8443:443 &
+          while ! nc -zv localhost 8443; do
+            sleep 2
+          done
+
+      - name: Create SRE and QA namespaces
+        working-directory: setup
+        run: |
+          kubectl create -f ns-sre.yaml -f ns-qa.yaml
+
+      - name: Create first ingress
+        working-directory: config
+        run: |
+          kubectl create -f ingress-first.yaml -n sre
+
+      - name: Create second ingress
+        working-directory: config
+        run: |
+          kubectl create -f ingress-second.yaml -n qa

@@ -1,0 +1,6 @@
+ca.*
+*.crt
+*.csr
+*.key
+*.tar.gz
+webhook-configuration.yaml
